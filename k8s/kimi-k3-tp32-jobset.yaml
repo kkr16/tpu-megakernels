@@ -1,0 +1,190 @@
+# Zero-Code-Change GKE TPU v7 (2x2x4, 4 hosts = 16 chips = 32 TensorCores) JobSet
+# for Inferact/tpu-megakernels (Kimi K3 + DSpark).
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: megakernels-kimi
+  labels:
+    app: megakernels-kimi
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true
+    subdomain: megakernels-kimi
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          backoffLimit: 0
+          completionMode: Indexed
+          template:
+            metadata:
+              labels:
+                app: megakernels-kimi
+            spec:
+              terminationGracePeriodSeconds: 5
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x2x4
+              tolerations:
+                - key: google.com/tpu
+                  operator: Equal
+                  value: present
+                  effect: NoSchedule
+              containers:
+                - name: megakernel
+                  image: vllm/vllm-tpu:nightly-20260807-73f3f63-a7a204c
+                  ports:
+                    - containerPort: 8471
+                      name: slicebuilder
+                    - containerPort: 8476
+                      name: coordinator
+                    - containerPort: 12377
+                      name: tp32coord
+                    - containerPort: 8000
+                      name: http
+                  command: ["/bin/bash", "-lc"]
+                  args:
+                    - |
+                      set -euo pipefail
+                      mkdir -p /opt/k3 /opt/gke-shim /gcs/safetensors /gcs/dspark
+                      tar xzf /bundle/tpu-megakernels-bundle.tgz -C /opt/k3
+                      cp /opt/k3/gke/shim/sitecustomize.py /opt/gke-shim/
+
+                      echo "[GKE] Installing pinned jax[tpu]==0.11.1 (libtpu==0.0.46.1) + tiktoken..."
+                      pip install --no-cache-dir "jax[tpu]==0.11.1" "tiktoken>=0.14.0" "ml_dtypes" >/dev/null
+
+                      python3 -c '
+                      import json, os, shutil, urllib.request, time
+                      from concurrent.futures import ThreadPoolExecutor
+
+                      bucket = os.environ.get("K3_GCS_BUCKET", "").strip()
+                      if bucket:
+                          req = urllib.request.Request(
+                              "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+                              headers={"Metadata-Flavor": "Google"},
+                          )
+                          token = json.loads(urllib.request.urlopen(req).read())["access_token"]
+                          headers = {"Authorization": f"Bearer {token}"}
+                          base_url = f"https://storage.googleapis.com/{bucket}"
+
+                          def dl_small(sub, fname, dest):
+                              r = urllib.request.Request(f"{base_url}/{sub}/{fname}", headers=headers)
+                              with open(dest, "wb") as f:
+                                  f.write(urllib.request.urlopen(r).read())
+
+                          for f in ("config.json", "model.safetensors.index.json", "tokenizer_config.json", "tokenization_kimi.py", "encoding_k3.py", "tiktoken.model", "generation_config.json"):
+                              dl_small("safetensors", f, f"/gcs/safetensors/{f}")
+                          for f in ("config.json", "config.py"):
+                              dl_small("dspark", f, f"/gcs/dspark/{f}")
+
+                          t0 = time.perf_counter()
+                          dspark_url = f"{base_url}/dspark/model.safetensors"
+                          head_req = urllib.request.Request(dspark_url, headers=headers, method="HEAD")
+                          size = int(urllib.request.urlopen(head_req).headers["Content-Length"])
+                          dest_path = "/gcs/dspark/model.safetensors"
+                          with open(dest_path, "wb") as f:
+                              f.truncate(size)
+                          chunk = (size + 15) // 16
+                          spans = [(i, min(i + chunk - 1, size - 1)) for i in range(0, size, chunk)]
+                          def grab(span):
+                              lo, hi = span
+                              r = urllib.request.Request(dspark_url, headers={**headers, "Range": f"bytes={lo}-{hi}"})
+                              data = urllib.request.urlopen(r).read()
+                              with open(dest_path, "r+b") as f:
+                                  f.seek(lo)
+                                  f.write(data)
+                          with ThreadPoolExecutor(16) as pool:
+                              list(pool.map(grab, spans))
+                          print(f"[GKE] Staged DSpark speculator ({size/1e9:.2f} GB) + Kimi K3 tokenizer from GCS in {time.perf_counter()-t0:.1f}s")
+                      else:
+                          from huggingface_hub import hf_hub_download
+                          for f in ("config.json", "model.safetensors.index.json", "tokenizer_config.json", "tokenization_kimi.py", "encoding_k3.py", "tiktoken.model", "generation_config.json"):
+                              shutil.copy(hf_hub_download("moonshotai/Kimi-K3", f), f"/gcs/safetensors/{f}")
+                          for f in ("config.json", "config.py", "model.safetensors"):
+                              shutil.copy(hf_hub_download("RedHatAI/Kimi-K3-speculator.dspark", f), f"/gcs/dspark/{f}")
+                          print("[GKE] Staged DSpark speculator + Kimi K3 tokenizer from Hugging Face Hub")
+                      '
+
+                      export PYTHONPATH="/opt/gke-shim:/opt/k3/tpu-megakernels"
+                      export SLURM_PROCID="${TPU_WORKER_ID:-${JOB_COMPLETION_INDEX:-0}}"
+                      export TP32_COORDINATOR="${TPU_WORKER_HOSTNAMES%%,*}:8476"
+                      export HF_HUB_OFFLINE="1"
+
+                      cd /opt/k3/tpu-megakernels
+                      echo "[GKE] Launching Inferact Kimi K3 + DSpark megakernel (rank=${SLURM_PROCID})..."
+                      exec python3 distributed_entry.py demo_kimi_dspark.py \
+                        --checkpoint /gcs/safetensors \
+                        --draft /gcs/dspark \
+                        --serve 0.0.0.0:8000 \
+                        --context "${K3_CONTEXT:-4096}" \
+                        --max-tokens "${K3_MAX_TOKENS:-512}" \
+                        --progress log \
+                        ${K3_EXTRA_ARGS:-}
+                  env:
+                    - name: PYTHONDONTWRITEBYTECODE
+                      value: "1"
+                    - name: XLA_FLAGS
+                      value: "--xla_allow_excess_precision=false"
+                    - name: JAX_PLATFORMS
+                      value: "tpu"
+                    - name: K3_WEIGHT_MODE
+                      value: "${K3_WEIGHT_MODE}"
+                    - name: K3_GCS_BUCKET
+                      value: "${K3_GCS_BUCKET}"
+                    - name: K3_ORBAX_CKPT
+                      value: "${K3_ORBAX_CKPT}"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "/tmp/jax_cache"
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    initialDelaySeconds: 15
+                    periodSeconds: 5
+                    failureThreshold: 180
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                    requests:
+                      cpu: "16"
+                      memory: "64Gi"
+                  volumeMounts:
+                    - name: bundle
+                      mountPath: /bundle
+                      readOnly: true
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: gcs-ckpt
+                      mountPath: /gcs
+              volumes:
+                - name: bundle
+                  configMap:
+                    name: tpu-megakernels-bundle
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                - name: gcs-ckpt
+                  emptyDir:
+                    sizeLimit: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: megakernels-kimi-http
+  labels:
+    app: megakernels-kimi
+spec:
+  selector:
+    jobset.sigs.k8s.io/jobset-name: megakernels-kimi
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
